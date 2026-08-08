@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import modal
 
 APP_NAME = "jaide-status-bench"
-LOCAL_PROJECT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+LOCAL_PROJECT_DIR = Path(__file__).resolve().parents[1]
 PROJECT_MOUNT_PATH = Path("/workspace/jaide")
 DATA_MOUNT_PATH = Path("/data")
 CHECKPOINT_MOUNT_PATH = Path("/checkpoints")
@@ -397,8 +397,7 @@ def _download_finephrase(target_path: Path, cap: int) -> Tuple[int, int]:
                             text = val.strip()
                             break
                 if text and len(text) > 20:
-                    f_out.write(json.dumps({"text": text}, ensure_ascii=False) + "
-")
+                    f_out.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
                     written += 1
                     if written >= cap:
                         break
@@ -784,20 +783,17 @@ def run_gpu_train_and_infer(
         _write_report(
             report_dir,
             "phase_c_loss_curve.jsonl",
-            "
-".join(json.dumps({"step": s, "loss": l}) for s, l in loss_curve),
+            "\n".join(json.dumps({"step": s, "loss": l}) for s, l in loss_curve),
         )
         _write_report(
             report_dir,
             "phase_c_recon_curve.jsonl",
-            "
-".join(json.dumps({"step": s, "recon": r}) for s, r in recon_curve),
+            "\n".join(json.dumps({"step": s, "recon": r}) for s, r in recon_curve),
         )
         _write_report(
             report_dir,
             "phase_c_source_rms_curve.jsonl",
-            "
-".join(json.dumps({"step": s, "source_rms": v}) for s, v in source_rms_curve),
+            "\n".join(json.dumps({"step": s, "source_rms": v}) for s, v in source_rms_curve),
         )
         checkpoint_volume.commit()
 
@@ -984,31 +980,27 @@ def main() -> None:
 
     _log("STEP 1: prepare_cpu")
     prep_result = prepare_cpu.remote(run_id)
-    print("
-" + "=" * 70)
+    print("\n" + "=" * 70)
     print("CPU PREPARE RESULT")
     print("=" * 70)
     print(json.dumps(prep_result, indent=2, default=str))
 
     if not prep_result.get("distributed_binary_present"):
-        print("
-" + "=" * 70)
+        print("\n" + "=" * 70)
         print("ABORT: distributed binary was not built")
         print("=" * 70)
         return
 
     dataset_ok = prep_result.get("phases", {}).get("C_prep_dataset", {}).get("sample_count", 0) > 0
     if not dataset_ok:
-        print("
-" + "=" * 70)
+        print("\n" + "=" * 70)
         print("ABORT: dataset not prepared")
         print("=" * 70)
         return
 
     _log("STEP 2: run_gpu_train_and_infer")
     gpu_result = run_gpu_train_and_infer.remote(run_id, prep_result)
-    print("
-" + "=" * 70)
+    print("\n" + "=" * 70)
     print("GPU PHASE RESULT")
     print("=" * 70)
     print(json.dumps(gpu_result, indent=2, default=str))
@@ -1018,8 +1010,7 @@ def main() -> None:
         "cpu_phase": prep_result,
         "gpu_phase": gpu_result,
     }
-    print("
-" + "=" * 70)
+    print("\n" + "=" * 70)
     print("FINAL RESULT")
     print("=" * 70)
     print(json.dumps(final, indent=2, default=str))
