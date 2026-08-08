@@ -80,6 +80,19 @@ def _run_checked(cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict[s
         return 127, "", str(e)
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+def _clear_rank_coordination_files(nccl_id_path: Path) -> None:
+    """Remove NCCL and rank-stage marker files from a previous launch."""
+    for path in (nccl_id_path, Path(str(nccl_id_path) + ".ready")):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        for marker in nccl_id_path.parent.glob(nccl_id_path.name + ".*"):
+            if marker.is_file() or marker.is_symlink():
+                marker.unlink()
+    except FileNotFoundError:
+        pass
 def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     if not path.is_file():
         return None
@@ -293,11 +306,7 @@ def train_all_ranks(
     local_binary.chmod(0o755)
     _log(f"binary ready at {local_binary}")
     nccl_id_path = Path("/tmp/jaide_nccl_id")
-    if nccl_id_path.exists():
-        nccl_id_path.unlink()
-    ready_path = Path("/tmp/jaide_nccl_id.ready")
-    if ready_path.exists():
-        ready_path.unlink()
+    _clear_rank_coordination_files(nccl_id_path)
     logs_dir = Path("/tmp/jaide_training_logs")
     _ensure_dir(logs_dir)
     _ensure_dir(CHECKPOINT_MOUNT_PATH)

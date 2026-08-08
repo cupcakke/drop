@@ -56,6 +56,7 @@ PHASE_B_STEPS = int(os.environ.get("JAIDE_BENCH_PHASE_B_STEPS", "2000"))
 SHUFFLE_TARGET_CONTROL = os.environ.get("JAIDE_BENCH_SHUFFLE_TARGET_CONTROL", "0")
 TARGET_SOURCE_FROZEN = os.environ.get("JAIDE_BENCH_TARGET_SOURCE_FROZEN", "1")
 SPECTRAL_DEPTH_COMPENSATION = os.environ.get("JAIDE_BENCH_SPECTRAL_DEPTH_COMPENSATION", "1")
+INFERENCE_STARTUP_TIMEOUT_SEC = int(os.environ.get("JAIDE_INFERENCE_STARTUP_TIMEOUT", "600"))
 
 app = modal.App(APP_NAME)
 
@@ -123,6 +124,19 @@ def _safe_unlink(path: Path) -> None:
             path.unlink()
     except FileNotFoundError:
         return
+
+
+def _clear_rank_coordination_files(nccl_id_path: str) -> None:
+    """Remove NCCL and filesystem-stage markers left by a previous launch."""
+    base = Path(nccl_id_path)
+    _safe_unlink(base)
+    _safe_unlink(Path(str(base) + ".ready"))
+    try:
+        for marker in base.parent.glob(base.name + ".*"):
+            if marker.is_file() or marker.is_symlink():
+                _safe_unlink(marker)
+    except FileNotFoundError:
+        pass
 
 
 def _terminate_process_group(proc: subprocess.Popen[Any]) -> None:
@@ -250,8 +264,7 @@ def _run_multirank(
     t0 = time.monotonic()
     deadline = t0 + timeout
 
-    for stale in [nccl_id_path, nccl_id_path + ".ready"]:
-        _safe_unlink(Path(stale))
+    _clear_rank_coordination_files(nccl_id_path)
 
     rank_envs: List[Dict[str, str]] = []
     for rank_index in range(num_gpus):
@@ -638,6 +651,9 @@ def run_gpu_train_and_infer(
     dataset_path = dataset_meta.get("dataset_path")
     sample_count = int(dataset_meta.get("sample_count", 0) or 0)
 
+    training_succeeded = False
+    training_started_ns = 0
+
     if not distributed_bin.exists():
         result["phases"]["C_training_convergence"] = {"skipped": "distributed binary missing"}
     elif not dataset_path or sample_count <= 0:
@@ -688,10 +704,10 @@ def run_gpu_train_and_infer(
         futhark_cache_path = CHECKPOINT_MOUNT_PATH / "futhark_gpu_cache.bin"
         train_env["JAIDE_FUTHARK_CACHE"] = str(futhark_cache_path)
 
-        for stale in ["/tmp/jaide_nccl_id", "/tmp/jaide_nccl_id.ready"]:
-            _safe_unlink(Path(stale))
+        _clear_rank_coordination_files("/tmp/jaide_nccl_id")
 
         t0 = time.time()
+        training_started_ns = time.time_ns()
         rc_c, out_c, _ = _run_multirank(
             cmd=[str(distributed_bin)],
             cwd=project_dir,
@@ -701,6 +717,7 @@ def run_gpu_train_and_infer(
             timeout=72000,
         )
         phase_c_duration = time.time() - t0
+        training_succeeded = rc_c == 0
 
         loss_curve: List[Tuple[int, float]] = []
         recon_curve: List[Tuple[int, float]] = []
@@ -799,129 +816,180 @@ def run_gpu_train_and_infer(
 
     if not inference_bin.exists():
         result["phases"]["D_inference"] = {"skipped": "inference binary missing"}
+    elif not training_succeeded:
+        result["phases"]["D_inference"] = {
+            "skipped": "training did not complete successfully; refusing to smoke-test a stale checkpoint",
+            "server_up": False,
+        }
     else:
         _log("=" * 70)
         _log("PHASE D: INFERENCE SERVER SMOKE TEST")
         _log("=" * 70)
-        checkpoints_root = CHECKPOINT_MOUNT_PATH
-        model_candidates = sorted(checkpoints_root.rglob("model.ckpt"), reverse=True)
-        model_path = str(model_candidates[0]) if model_candidates else None
-        _log(f"model_path candidate: {model_path}")
 
-        inf_env = env.copy()
-        if model_path:
-            inf_env["JAIDE_MODEL_PATH"] = model_path
-        inf_env.setdefault("NCCL_DEBUG", "WARN")
-
-        srv_log_path = report_dir / "phase_d_server.log"
-        with open(srv_log_path, "w", encoding="utf-8") as srv_f:
-            srv_proc = subprocess.Popen(
-                [str(inference_bin), "--port", "8080", "--host", "127.0.0.1", "--allow-anonymous"],
-                cwd=project_dir,
-                env=inf_env,
-                stdout=srv_f,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-
+        model_candidates: List[Path] = []
+        for candidate in CHECKPOINT_MOUNT_PATH.rglob("model.ckpt"):
             try:
-                server_up = False
-                health_json = ""
-                for _ in range(40):
-                    time.sleep(0.5)
-                    rc_h, out_h, _ = _run(
-                        [
-                            "curl",
-                            "-sS",
-                            "-o",
-                            "/tmp/health.json",
-                            "-w",
-                            "%{http_code}",
-                            "http://127.0.0.1:8080/v1/health",
-                        ],
-                        cwd=project_dir,
-                        env=inf_env,
-                        check=False,
-                        timeout=10,
-                    )
-                    if rc_h == 0 and out_h.strip() == "200":
-                        server_up = True
-                        if Path("/tmp/health.json").exists():
-                            health_json = Path("/tmp/health.json").read_text(
-                                encoding="utf-8", errors="replace"
-                            )
-                        break
+                if candidate.stat().st_mtime_ns >= training_started_ns:
+                    model_candidates.append(candidate)
+            except OSError:
+                continue
+        model_candidates.sort(key=lambda candidate: (candidate.stat().st_mtime_ns, str(candidate)), reverse=True)
+        model_path = str(model_candidates[0]) if model_candidates else None
+        _log(f"model_path candidate from this run: {model_path}")
 
-                if not server_up:
-                    result["phases"]["D_inference"] = {
-                        "error": "health endpoint never responded 200",
-                        "server_up": False,
-                    }
-                else:
-                    _log(f"health OK: {health_json}")
+        if not model_path:
+            result["phases"]["D_inference"] = {
+                "error": "training completed but did not publish a fresh model.ckpt",
+                "server_up": False,
+            }
+        else:
+            inf_env = env.copy()
+            inf_env["JAIDE_MODEL_PATH"] = model_path
+            inf_env.setdefault("NCCL_DEBUG", "WARN")
 
-                    prompt = "The reversible sparse flow model demonstrates"
-                    req_body = json.dumps({"text": prompt, "max_tokens": 20})
-                    t0 = time.time()
-                    rc_i, out_i, _ = _run(
-                        [
-                            "curl",
-                            "-sS",
-                            "-X",
-                            "POST",
-                            "-H",
-                            "Content-Type: application/json",
-                            "-d",
-                            req_body,
-                            "http://127.0.0.1:8080/v1/inference",
-                        ],
-                        cwd=project_dir,
-                        env=inf_env,
-                        check=False,
-                        timeout=60,
-                    )
-                    inference_duration = time.time() - t0
+            srv_log_path = report_dir / "phase_d_server.log"
+            with open(srv_log_path, "w", encoding="utf-8") as srv_f:
+                srv_proc = subprocess.Popen(
+                    [str(inference_bin), "--port", "8080", "--host", "127.0.0.1", "--allow-anonymous"],
+                    cwd=project_dir,
+                    env=inf_env,
+                    stdout=srv_f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
 
-                    parsed: Optional[Dict[str, Any]] = None
-                    try:
-                        parsed_candidate = json.loads(out_i)
-                        if isinstance(parsed_candidate, dict):
-                            parsed = parsed_candidate
-                    except Exception:
-                        parsed = None
+                try:
+                    server_up = False
+                    health_json = ""
+                    health: Optional[Dict[str, Any]] = None
+                    startup_attempts = max(1, INFERENCE_STARTUP_TIMEOUT_SEC * 2)
+                    for _ in range(startup_attempts):
+                        time.sleep(0.5)
+                        rc_h, out_h, _ = _run(
+                            [
+                                "curl",
+                                "-sS",
+                                "-o",
+                                "/tmp/health.json",
+                                "-w",
+                                "%{http_code}",
+                                "http://127.0.0.1:8080/v1/health",
+                            ],
+                            cwd=project_dir,
+                            env=inf_env,
+                            check=False,
+                            timeout=10,
+                        )
+                        if rc_h != 0 or out_h.strip() != "200" or not Path("/tmp/health.json").exists():
+                            continue
+                        health_json = Path("/tmp/health.json").read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        try:
+                            parsed_health = json.loads(health_json)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(parsed_health, dict):
+                            continue
+                        health = parsed_health
+                        if health.get("status") == "healthy" and health.get("model_loaded") is True:
+                            server_up = True
+                            break
 
-                    generated_tokens: List[int] = []
-                    generated_text_value = ""
-                    if isinstance(parsed, dict):
-                        raw_tokens = parsed.get("tokens")
-                        if isinstance(raw_tokens, list):
-                            generated_tokens = [t for t in raw_tokens if isinstance(t, int)]
-                        raw_text = parsed.get("text")
-                        if isinstance(raw_text, str):
-                            generated_text_value = raw_text
+                    if not server_up:
+                        try:
+                            server_log = srv_log_path.read_text(encoding="utf-8", errors="replace")[-8000:]
+                        except OSError:
+                            server_log = ""
+                        result["phases"]["D_inference"] = {
+                            "error": "health endpoint never reported a loaded model",
+                            "server_up": False,
+                            "health": health_json,
+                            "server_log_tail": server_log,
+                            "model_path": model_path,
+                        }
+                    else:
+                        _log(f"health OK: {health_json}")
 
-                    distinct_tokens = len(set(generated_tokens))
-                    non_reserved = [t for t in generated_tokens if t >= 4]
+                        prompt = "The reversible sparse flow model demonstrates"
+                        req_body = json.dumps({"text": prompt, "max_tokens": 20})
+                        inference_response_path = Path("/tmp/inference.json")
+                        _safe_unlink(inference_response_path)
+                        t0 = time.time()
+                        rc_i, out_i, _ = _run(
+                            [
+                                "curl",
+                                "-sS",
+                                "-o",
+                                str(inference_response_path),
+                                "-w",
+                                "%{http_code}",
+                                "-X",
+                                "POST",
+                                "-H",
+                                "Content-Type: application/json",
+                                "-d",
+                                req_body,
+                                "http://127.0.0.1:8080/v1/inference",
+                            ],
+                            cwd=project_dir,
+                            env=inf_env,
+                            check=False,
+                            timeout=60,
+                        )
+                        inference_duration = time.time() - t0
+                        response_body = (
+                            inference_response_path.read_text(encoding="utf-8", errors="replace")
+                            if inference_response_path.exists()
+                            else ""
+                        )
 
-                    result["phases"]["D_inference"] = {
-                        "returncode": rc_i,
-                        "duration_s": round(inference_duration, 2),
-                        "health": health_json,
-                        "prompt": prompt,
-                        "response_body": out_i,
-                        "response_parsed": parsed,
-                        "server_up": True,
-                        "model_path": model_path,
-                        "generated_token_count": len(generated_tokens),
-                        "generated_distinct_tokens": distinct_tokens,
-                        "generated_non_reserved_count": len(non_reserved),
-                        "generated_text_length": len(generated_text_value),
-                        "generation_produced_output": len(generated_tokens) > 0,
-                        "generation_is_degenerate": len(generated_tokens) > 1 and distinct_tokens <= 1,
-                    }
-                    _write_report(report_dir, "phase_d_inference.log", out_i)
-            finally:
-                _terminate_process_group(srv_proc)
+                        parsed: Optional[Dict[str, Any]] = None
+                        try:
+                            parsed_candidate = json.loads(response_body)
+                            if isinstance(parsed_candidate, dict):
+                                parsed = parsed_candidate
+                        except json.JSONDecodeError:
+                            pass
+
+                        generated_tokens: List[int] = []
+                        generated_text_value = ""
+                        if isinstance(parsed, dict):
+                            raw_tokens = parsed.get("tokens")
+                            if isinstance(raw_tokens, list):
+                                generated_tokens = [t for t in raw_tokens if isinstance(t, int)]
+                            raw_text = parsed.get("text")
+                            if isinstance(raw_text, str):
+                                generated_text_value = raw_text
+
+                        distinct_tokens = len(set(generated_tokens))
+                        non_reserved = [t for t in generated_tokens if t >= 4]
+                        inference_http_status = out_i.strip()
+                        smoke_ok = rc_i == 0 and inference_http_status == "200" and parsed is not None
+
+                        result["phases"]["D_inference"] = {
+                            "returncode": rc_i,
+                            "http_status": inference_http_status,
+                            "duration_s": round(inference_duration, 2),
+                            "health": health_json,
+                            "prompt": prompt,
+                            "response_body": response_body,
+                            "response_parsed": parsed,
+                            "server_up": True,
+                            "model_path": model_path,
+                            "generated_token_count": len(generated_tokens),
+                            "generated_distinct_tokens": distinct_tokens,
+                            "generated_non_reserved_count": len(non_reserved),
+                            "generated_text_length": len(generated_text_value),
+                            "generation_produced_output": len(generated_tokens) > 0,
+                            "generation_is_degenerate": len(generated_tokens) > 1 and distinct_tokens <= 1,
+                            "smoke_passed": smoke_ok,
+                        }
+                        if not smoke_ok:
+                            result["phases"]["D_inference"]["error"] = "inference endpoint did not return a valid HTTP 200 JSON response"
+                        _write_report(report_dir, "phase_d_inference.log", response_body)
+                finally:
+                    _terminate_process_group(srv_proc)
 
     gpu_phase_duration = time.time() - gpu_phase_start
     result["gpu_phase_duration_s"] = round(gpu_phase_duration, 2)
@@ -956,6 +1024,8 @@ def main() -> None:
         raise ValueError("JAIDE_BENCH_RELATIONAL_PASS_INTERVAL must be positive")
     if NUM_GPUS <= 0:
         raise ValueError("JAIDE_BENCH_NUM_GPUS must be a positive integer")
+    if INFERENCE_STARTUP_TIMEOUT_SEC <= 0:
+        raise ValueError("JAIDE_INFERENCE_STARTUP_TIMEOUT must be positive")
     try:
         reconstruction_alpha_value = float(RECONSTRUCTION_ALPHA)
     except ValueError as exc:
