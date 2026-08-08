@@ -4,6 +4,7 @@ const ArrayList = std.ArrayList;
 const core_types = @import("../core/types.zig");
 const core_tensor = @import("../core/tensor.zig");
 const core_memory = @import("../core/memory.zig");
+const core_io = @import("../core/io.zig");
 const PRNG = core_types.PRNG;
 
 var global_prng_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -1814,27 +1815,115 @@ pub const BayesianOptimizer = struct {
 pub const GPUMetrics = struct {
     utilization_percent: f32,
     memory_used_gb: f32,
-    tensor_core_util: f32,
-    nvlink_bandwidth_util: f32,
+    /// NVIDIA's standard management interface does not expose this counter on
+    /// every driver/GPU combination.  `null` means "not reported", never a
+    /// fabricated zero-percent measurement.
+    tensor_core_util: ?f32,
+    /// NVLink utilization requires link-counter support from the active
+    /// driver.  `null` means that the driver did not provide a usable sample.
+    nvlink_bandwidth_util: ?f32,
 };
 
 pub const B200Profiler = struct {
     allocator: Allocator,
+    device_index: usize,
+    last_sample: ?GPUMetrics = null,
+    last_sample_ns: i128 = 0,
 
     pub fn init(allocator: Allocator) !B200Profiler {
-        return B200Profiler{ .allocator = allocator };
-    }
-
-    pub fn captureGPUMetrics(self: *B200Profiler) !GPUMetrics {
-        _ = self;
-        return GPUMetrics{
-            .utilization_percent = 0.0,
-            .memory_used_gb = 0.0,
-            .tensor_core_util = 0.0,
-            .nvlink_bandwidth_util = 0.0,
+        return B200Profiler{
+            .allocator = allocator,
+            .device_index = localDeviceIndex(),
         };
     }
+
+    /// Reads live utilization and memory values from NVIDIA's management
+    /// interface.  Tensor-core and NVLink counters are intentionally optional:
+    /// `nvidia-smi` does not publish those counters consistently across B200
+    /// driver versions, and reporting zero would be a false measurement.
+    pub fn captureGPUMetrics(self: *B200Profiler) !GPUMetrics {
+        const now_ns = std.time.nanoTimestamp();
+        if (self.last_sample) |sample| {
+            if (now_ns - self.last_sample_ns < @as(i128, std.time.ns_per_s)) return sample;
+        }
+
+        const command_result = try std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used",
+                "--format=csv,noheader,nounits",
+            },
+            .max_output_bytes = 64 * 1024,
+        });
+        defer self.allocator.free(command_result.stdout);
+        defer self.allocator.free(command_result.stderr);
+
+        switch (command_result.term) {
+            .Exited => |code| if (code != 0) return error.GPUTelemetryUnavailable,
+            else => return error.GPUTelemetryUnavailable,
+        }
+
+        const sample = try parseNvidiaSmiSample(command_result.stdout, self.device_index);
+        const metrics = GPUMetrics{
+            .utilization_percent = sample.utilization_percent,
+            .memory_used_gb = sample.memory_used_mib / 1024.0,
+            .tensor_core_util = null,
+            .nvlink_bandwidth_util = null,
+        };
+        self.last_sample = metrics;
+        self.last_sample_ns = now_ns;
+        return metrics;
+    }
+
+    const NvidiaSmiSample = struct {
+        utilization_percent: f32,
+        memory_used_mib: f32,
+    };
+
+    fn localDeviceIndex() usize {
+        const rank_text = std.posix.getenv("LOCAL_RANK") orelse return 0;
+        return std.fmt.parseInt(usize, rank_text, 10) catch 0;
+    }
+
+    fn parseNvidiaSmiValue(raw: []const u8) !f32 {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "n/a")) {
+            return error.GPUTelemetryUnavailable;
+        }
+        const parsed = std.fmt.parseFloat(f32, value) catch return error.GPUTelemetryUnavailable;
+        if (!std.math.isFinite(parsed) or parsed < 0.0) return error.GPUTelemetryUnavailable;
+        return parsed;
+    }
+
+    fn parseNvidiaSmiSample(output: []const u8, device_index: usize) !NvidiaSmiSample {
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        var index: usize = 0;
+        while (lines.next()) |line| {
+            if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+            if (index != device_index) {
+                index += 1;
+                continue;
+            }
+
+            var values = std.mem.splitScalar(u8, line, ',');
+            const utilization = try parseNvidiaSmiValue(values.next() orelse return error.GPUTelemetryUnavailable);
+            const memory_used = try parseNvidiaSmiValue(values.next() orelse return error.GPUTelemetryUnavailable);
+            if (values.next() != null) return error.GPUTelemetryUnavailable;
+            return .{
+                .utilization_percent = utilization,
+                .memory_used_mib = memory_used,
+            };
+        }
+        return error.GPUTelemetryUnavailable;
+    }
 };
+
+test "B200 profiler parses live nvidia-smi CSV samples" {
+    const sample = try B200Profiler.parseNvidiaSmiSample("47, 2048\n", 0);
+    try std.testing.expectEqual(@as(f32, 47.0), sample.utilization_percent);
+    try std.testing.expectEqual(@as(f32, 2048.0), sample.memory_used_mib);
+}
 
 pub const MetricsStore = struct {
     training_losses: ArrayList(f32),
@@ -1915,11 +2004,18 @@ pub const PerformanceMonitor = struct {
         try self.metrics.parameter_norms.append(param_norm);
         try self.metrics.step_times_ms.append(step_time_ms);
 
-        const gpu_metrics = try self.profiler.captureGPUMetrics();
+        // Telemetry is best-effort: a CPU-only host or a restricted container
+        // has no NVIDIA management endpoint, but that must not fabricate zero
+        // GPU measurements or make optimizer updates fail.
+        const gpu_metrics = self.profiler.captureGPUMetrics() catch return;
         try self.metrics.gpu_utilization.append(gpu_metrics.utilization_percent);
         try self.metrics.memory_usage_gb.append(gpu_metrics.memory_used_gb);
-        try self.metrics.tensor_core_utilization.append(gpu_metrics.tensor_core_util);
-        try self.metrics.nvlink_bandwidth_utilization.append(gpu_metrics.nvlink_bandwidth_util);
+        if (gpu_metrics.tensor_core_util) |value| {
+            try self.metrics.tensor_core_utilization.append(value);
+        }
+        if (gpu_metrics.nvlink_bandwidth_util) |value| {
+            try self.metrics.nvlink_bandwidth_utilization.append(value);
+        }
     }
 
     pub fn generateReport(self: *PerformanceMonitor) !Report {
@@ -2240,7 +2336,7 @@ pub const SFD = struct {
     pub fn saveState(self: *const SFD, path: []const u8) !void {
         if (!self.initialized) return error.NotInitialized;
 
-        var file = try std.fs.cwd().createFile(path, .{ .mode = 0o600 });
+        var file = try core_io.createFilePath(path, .{ .mode = 0o600 });
         defer file.close();
 
         var buffered = std.io.bufferedWriter(file.writer());
@@ -2265,7 +2361,7 @@ pub const SFD = struct {
     pub fn loadState(self: *SFD, path: []const u8) !void {
         if (!self.initialized) return error.NotInitialized;
 
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+        const file = try core_io.openFilePath(path, .{ .mode = .read_only });
         defer file.close();
 
         var buffered = std.io.bufferedReader(file.reader());

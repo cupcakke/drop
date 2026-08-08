@@ -4,6 +4,7 @@ const Allocator = mem.Allocator;
 const testing = std.testing;
 const core_tensor = @import("../core/tensor.zig");
 const core_memory = @import("../core/memory.zig");
+const core_io = @import("../core/io.zig");
 
 pub const MGT = struct {
     token_to_id: std.StringHashMap(u32),
@@ -1245,7 +1246,7 @@ pub const MGT = struct {
     }
 
     pub fn saveVocab(self: *MGT, path: []const u8) !void {
-        var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        var file = try core_io.createFilePath(path, .{ .truncate = true });
         defer file.close();
 
         var writer = file.writer();
@@ -1357,7 +1358,7 @@ pub const MGT = struct {
     pub fn loadVocab(self: *MGT, path: []const u8) !void {
         self.reset();
 
-        var file = try std.fs.cwd().openFile(path, .{});
+        var file = try core_io.openFilePath(path, .{});
         defer file.close();
 
         var reader = file.reader();

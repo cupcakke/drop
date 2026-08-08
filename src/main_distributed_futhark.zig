@@ -37,6 +37,14 @@ fn extractDatasetText(
     };
 }
 
+fn openDatasetFile(dataset_path: []const u8) !std.fs.File {
+    if (dataset_path.len == 0) return error.InvalidDatasetPath;
+    if (std.fs.path.isAbsolute(dataset_path)) {
+        return std.fs.openFileAbsolute(dataset_path, .{ .mode = .read_only });
+    }
+    return std.fs.cwd().openFile(dataset_path, .{ .mode = .read_only });
+}
+
 fn appendDatasetRange(
     allocator: std.mem.Allocator,
     dataset_path: []const u8,
@@ -47,7 +55,7 @@ fn appendDatasetRange(
 ) !usize {
     if (end_valid_index <= start_valid_index) return 0;
 
-    const file = try std.fs.openFileAbsolute(dataset_path, .{ .mode = .read_only });
+    const file = try openDatasetFile(dataset_path);
     defer file.close();
 
     var buffered_reader = std.io.bufferedReader(file.reader());
@@ -133,10 +141,7 @@ fn loadDataset(
             .{coordinator.rank},
         );
 
-        const count_file = try std.fs.openFileAbsolute(
-            dataset_path,
-            .{ .mode = .read_only },
-        );
+        const count_file = try openDatasetFile(dataset_path);
         defer count_file.close();
 
         var buffered_reader = std.io.bufferedReader(count_file.reader());
@@ -283,10 +288,7 @@ fn loadTokenizerDataset(
     else
         0;
 
-    const file = try std.fs.openFileAbsolute(
-        dataset_path,
-        .{ .mode = .read_only },
-    );
+    const file = try openDatasetFile(dataset_path);
     defer file.close();
 
     var buffered_reader = std.io.bufferedReader(file.reader());
@@ -564,7 +566,10 @@ fn deployToModal(allocator: std.mem.Allocator, args: [][:0]u8) !void {
     else
         "/data/dataset/train.jsonl";
 
-    var client = try modal_gpu.ModalGPUClient.init(allocator, api_token);
+    var job_config = try modal_gpu.TrainingJobConfig.fromEnvironment(allocator);
+    defer job_config.deinit();
+
+    var client = try modal_gpu.ModalGPUClient.init(allocator, api_token, &job_config);
     defer client.deinit();
 
     const job_id = try client.deployTrainingJob(model_path, dataset_path);

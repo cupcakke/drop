@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Tensor = @import("tensor.zig").Tensor;
+const core_io = @import("io.zig");
 
 pub const LearnedEmbedding = struct {
     weight: Tensor,
@@ -139,7 +140,7 @@ pub const LearnedEmbedding = struct {
     }
 
     pub fn save(self: *const LearnedEmbedding, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
+        const file = try core_io.createFilePath(path, .{});
         defer file.close();
         var buf_writer = std.io.bufferedWriter(file.writer());
         const writer = buf_writer.writer();
@@ -154,7 +155,7 @@ pub const LearnedEmbedding = struct {
     }
 
     pub fn load(allocator: Allocator, path: []const u8) !LearnedEmbedding {
-        const file = std.fs.cwd().openFile(path, .{}) catch return error.FileNotFound;
+        const file = core_io.openFilePath(path, .{}) catch return error.FileNotFound;
         defer file.close();
         var buf_reader = std.io.bufferedReader(file.reader());
         const reader = buf_reader.reader();

@@ -49,18 +49,15 @@ pub const FutharkContext = struct {
         const cfg = futhark.futhark_context_config_new();
         if (cfg == null) return AccelError.FutharkConfigFailed;
 
-        if (gpu_enabled) {
-            futhark.gpu_stub.set_device(cfg, "");
-            futhark.gpu_stub.set_default_group_size(cfg, 256);
-            futhark.gpu_stub.set_default_num_groups(cfg, 128);
-            futhark.gpu_stub.set_default_tile_size(cfg, 32);
-
-            if (std.posix.getenv("JAIDE_FUTHARK_CACHE")) |cache_path| {
+        if (comptime gpu_enabled) {
+            const cache_file: ?[*:0]const u8 = if (std.posix.getenv("JAIDE_FUTHARK_CACHE")) |cache_path| blk: {
                 std.debug.print("[FutharkContext] GPU kernel cache: {s}\n", .{cache_path});
-                futhark.gpu_stub.set_cache_file(cfg, @as([*:0]const u8, @ptrCast(cache_path.ptr)));
-            } else {
+                break :blk @as([*:0]const u8, @ptrCast(cache_path.ptr));
+            } else blk: {
                 std.debug.print("[FutharkContext] WARN: JAIDE_FUTHARK_CACHE not set — NVRTC will recompile on every container start\n", .{});
-            }
+                break :blk null;
+            };
+            futhark.configureGpuContext(cfg, cache_file) catch return AccelError.FutharkConfigFailed;
         }
 
         const ctx = futhark.futhark_context_new(cfg);
@@ -150,7 +147,7 @@ pub const PinnedMemory = struct {
             return Self{ .ptr = null, .size = 0, .fallback_slice = null };
         }
 
-        if (gpu_enabled) {
+        if (comptime gpu_enabled) {
             var ptr: ?*anyopaque = null;
             const err = cuda.cudaHostAlloc(&ptr, size, cuda.cudaHostAllocDefault);
             if (err != cuda.cudaSuccess) {
@@ -180,7 +177,7 @@ pub const PinnedMemory = struct {
             return;
         }
         if (self.ptr) |p| {
-            if (gpu_enabled) {
+            if (comptime gpu_enabled) {
                 _ = cuda.cudaFreeHost(p);
             }
             self.ptr = null;
