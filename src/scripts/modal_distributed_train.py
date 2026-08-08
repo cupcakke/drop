@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import modal
 APP_NAME = "jaide-v40-distributed-training"
-GPU_SPEC = "B200+:8"
+GPU_SPEC = "B200:1"
 DATA_VOLUME_NAME = "jaide-training-data"
 CHECKPOINT_VOLUME_NAME = "jaide-checkpoints"
 DATA_MOUNT_PATH = Path("/data")
@@ -21,11 +21,11 @@ BINARY_PATH = PROJECT_MOUNT_PATH / "zig-out" / "bin" / "jaide-distributed-futhar
 BINARY_CACHE_PATH = CHECKPOINT_MOUNT_PATH / "jaide-distributed-futhark"
 BUILD_VERSION_FILE = CHECKPOINT_MOUNT_PATH / "build_version.txt"
 VOCAB_PATH = CHECKPOINT_MOUNT_PATH / "tokenizer.vocab"
-CPU_REQUEST = 64.0
-CPU_LIMIT = 80.0
-MEMORY_REQUEST_MB = 262144
-MEMORY_LIMIT_MB = 262144
-EPHEMERAL_DISK_MB = 3145728
+CPU_REQUEST = 32.0
+CPU_LIMIT = 40.0
+MEMORY_REQUEST_MB = 131072
+MEMORY_LIMIT_MB = 131072
+EPHEMERAL_DISK_MB = 1572864
 TIMEOUT_SECONDS = 86400
 LOCAL_PROJECT_DIR = (Path(__file__).resolve().parent / "../..").resolve()
 IGNORE_PATTERNS = [
@@ -72,14 +72,18 @@ jaide_image = (
 )
 data_volume = modal.Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True)
 checkpoint_volume = modal.Volume.from_name(CHECKPOINT_VOLUME_NAME, create_if_missing=True)
+DATASET_MAX_SAMPLES = 10000000000
+
 def _run_checked(cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
     try:
         p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
         return p.returncode, p.stdout or "", p.stderr or ""
     except FileNotFoundError as e:
         return 127, "", str(e)
+
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
 def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     if not path.is_file():
         return None
@@ -91,11 +95,13 @@ def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
     except (OSError, json.JSONDecodeError):
         return None
     return None
+
 def _write_json_file(path: Path, value: Dict[str, Any]) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(value, f, indent=2, ensure_ascii=False)
     tmp_path.replace(path)
+
 def _count_lines(path: Path) -> int:
     count = 0
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -103,6 +109,7 @@ def _count_lines(path: Path) -> int:
             if line.strip():
                 count += 1
     return count
+
 def _extract_text_from_row(row: Any) -> str:
     if not isinstance(row, dict):
         return ""
@@ -114,9 +121,10 @@ def _extract_text_from_row(row: Any) -> str:
         if isinstance(val, str) and len(val.strip()) > 50:
             return val.strip()
     return ""
+
 DATASET_NAME = "HuggingFaceFW/finephrase"
 DATASET_CONFIG = "faq"
-DATASET_MAX_SAMPLES = 100_000
+
 def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     from datasets import load_dataset
     _ensure_dir(DATASET_DIR)
@@ -153,6 +161,7 @@ def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     _write_json_file(DATASET_METADATA_FILE, {"dataset_path": str(DATASET_FILE), "dataset_size": size, "line_count": line_count})
     volume.commit()
     return str(DATASET_FILE), size, line_count
+
 def _build_zig_gpu(project_dir: str, force: bool = False) -> None:
     if BINARY_PATH.is_file() and not force:
         return
@@ -165,10 +174,8 @@ def _build_zig_gpu(project_dir: str, force: bool = False) -> None:
     if not BINARY_PATH.is_file():
         raise FileNotFoundError(f"GPU binary not found at {BINARY_PATH}")
     BINARY_PATH.chmod(0o755)
+
 def _ensure_binary_in_cache(volume: modal.Volume) -> str:
-    """Build the GPU binary on a CPU container, then cache it in checkpoint volume.
-    Returns the build_version (git-like hash of source) of the cached binary.
-    """
     import hashlib
     def _source_hash() -> str:
         h = hashlib.sha256()
@@ -207,6 +214,7 @@ def _ensure_binary_in_cache(volume: modal.Volume) -> str:
     volume.commit()
     print(f"Cached GPU binary at {BINARY_CACHE_PATH}")
     return expected_version
+
 def _detect_gpus() -> Tuple[int, str]:
     try:
         p = subprocess.run(["nvidia-smi", "--list-gpus"], capture_output=True, text=True)
@@ -215,6 +223,7 @@ def _detect_gpus() -> Tuple[int, str]:
     output = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
     lines = [l for l in (p.stdout or "").splitlines() if l.strip()]
     return len(lines), output
+
 def _expected_gpu_count() -> int:
     if ":" not in GPU_SPEC:
         return 1
@@ -222,6 +231,7 @@ def _expected_gpu_count() -> int:
         return int(GPU_SPEC.rsplit(":", 1)[1])
     except ValueError:
         return 1
+
 def _extract_loss(stdout: str) -> Optional[float]:
     if not stdout:
         return None
@@ -235,6 +245,7 @@ def _extract_loss(stdout: str) -> Optional[float]:
             except ValueError:
                 continue
     return loss_value
+
 def _read_tail(path: Path, max_chars: int = 8000) -> str:
     if not path.is_file():
         return ""
@@ -245,6 +256,7 @@ def _read_tail(path: Path, max_chars: int = 8000) -> str:
             f.seek(size - byte_count)
         data = f.read()
     return data.decode("utf-8", errors="replace")[-max_chars:]
+
 @app.function(
     image=jaide_image,
     gpu=GPU_SPEC,
@@ -258,11 +270,11 @@ def _read_tail(path: Path, max_chars: int = 8000) -> str:
     },
 )
 def train_all_ranks(
-    epochs: int = 5,
-    model_dim: int = 2048,
-    num_layers: int = 24,
+    epochs: int = 1,
+    model_dim: int = 11200,
+    num_layers: int = 12,
     local_batch_size: int = 2,
-    world_size: int = 8,
+    world_size: int = 1,
 ) -> Dict[str, Any]:
     import threading
     def _log(msg: str) -> None:
@@ -325,7 +337,7 @@ def train_all_ranks(
     base_env["JAIDE_BATCH_SIZE"] = str(local_batch_size)
     base_env["JAIDE_NCCL_ID_PATH"] = str(nccl_id_path)
     base_env["JAIDE_TOTAL_SAMPLES"] = str(sample_count)
-    base_env["JAIDE_MAX_SAMPLES"] = str(sample_count)
+    base_env["JAIDE_MAX_SAMPLES"] = str(DATASET_MAX_SAMPLES)
     base_env["JAIDE_MAX_SEQ_LEN"] = "2048"
     base_env["JAIDE_LEARNING_RATE"] = "0.0001"
     base_env["JAIDE_REASONING_CYCLES"] = "1"
@@ -451,13 +463,14 @@ def train_all_ranks(
         "elapsed_seconds": elapsed,
         "rank_results": rank_results,
     }
+
 @app.local_entrypoint()
 def main(
-    epochs: int = 5,
-    model_dim: int = 2048,
-    num_layers: int = 24,
+    epochs: int = 1,
+    model_dim: int = 11200,
+    num_layers: int = 12,
     local_batch_size: int = 2,
-    world_size: int = 8,
+    world_size: int = 1,
 ) -> None:
     result = train_all_ranks.remote(
         epochs=epochs,
