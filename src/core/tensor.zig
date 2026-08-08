@@ -2327,18 +2327,18 @@ pub const Tensor = struct {
                 const upper_value = self.data[column * self.shape.strides[0] + row * self.shape.strides[1]];
                 if (!math.isFinite(lower_value) or !math.isFinite(upper_value)) return error.MatrixNotPositiveDefinite;
                 if (@abs(@as(f64, lower_value) - @as(f64, upper_value)) > symmetry_threshold) return error.MatrixNotPositiveDefinite;
-                var sum = (@as(f64, lower_value) + @as(f64, upper_value)) * 0.5;
+                var cholesky_sum = (@as(f64, lower_value) + @as(f64, upper_value)) * 0.5;
                 var inner: usize = 0;
                 while (inner < column) : (inner += 1) {
-                    sum -= @as(f64, result.data[row * n + inner]) * @as(f64, result.data[column * n + inner]);
+                    cholesky_sum -= @as(f64, result.data[row * n + inner]) * @as(f64, result.data[column * n + inner]);
                 }
                 if (row == column) {
-                    if (!math.isFinite(sum) or sum <= positivity_threshold) return error.MatrixNotPositiveDefinite;
-                    result.data[row * n + column] = @floatCast(@sqrt(sum));
+                    if (!math.isFinite(cholesky_sum) or cholesky_sum <= positivity_threshold) return error.MatrixNotPositiveDefinite;
+                    result.data[row * n + column] = @floatCast(@sqrt(cholesky_sum));
                 } else {
                     const pivot = result.data[column * n + column];
                     if (!math.isFinite(pivot) or pivot <= 0.0) return error.MatrixNotPositiveDefinite;
-                    const value = sum / @as(f64, pivot);
+                    const value = cholesky_sum / @as(f64, pivot);
                     if (!math.isFinite(value)) return error.MatrixNotPositiveDefinite;
                     result.data[row * n + column] = @floatCast(value);
                 }
@@ -2358,14 +2358,14 @@ pub const Tensor = struct {
         while (column < n) : (column += 1) {
             var row: usize = 0;
             while (row < n) : (row += 1) {
-                var sum: f64 = if (row == column) 1.0 else 0.0;
+                var triangular_sum: f64 = if (row == column) 1.0 else 0.0;
                 var inner: usize = 0;
                 while (inner < row) : (inner += 1) {
-                    sum -= @as(f64, lower.data[row * n + inner]) * @as(f64, inverse_lower.data[inner * n + column]);
+                    triangular_sum -= @as(f64, lower.data[row * n + inner]) * @as(f64, inverse_lower.data[inner * n + column]);
                 }
                 const pivot = lower.data[row * n + row];
                 if (!math.isFinite(pivot) or pivot <= 0.0) return error.MatrixNotPositiveDefinite;
-                const value = sum / @as(f64, pivot);
+                const value = triangular_sum / @as(f64, pivot);
                 if (!math.isFinite(value)) return error.MatrixNotPositiveDefinite;
                 inverse_lower.data[row * n + column] = @floatCast(value);
             }
@@ -2377,13 +2377,13 @@ pub const Tensor = struct {
         while (row < n) : (row += 1) {
             column = row;
             while (column < n) : (column += 1) {
-                var sum: f64 = 0.0;
+                var inverse_sum: f64 = 0.0;
                 var inner: usize = @max(row, column);
                 while (inner < n) : (inner += 1) {
-                    sum += @as(f64, inverse_lower.data[inner * n + row]) * @as(f64, inverse_lower.data[inner * n + column]);
+                    inverse_sum += @as(f64, inverse_lower.data[inner * n + row]) * @as(f64, inverse_lower.data[inner * n + column]);
                 }
-                if (!math.isFinite(sum)) return error.MatrixNotPositiveDefinite;
-                const value: f32 = @floatCast(sum);
+                if (!math.isFinite(inverse_sum)) return error.MatrixNotPositiveDefinite;
+                const value: f32 = @floatCast(inverse_sum);
                 result.data[row * n + column] = value;
                 result.data[column * n + row] = value;
             }
