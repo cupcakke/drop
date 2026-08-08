@@ -254,6 +254,7 @@ pub const TrainerError = error{
     DistributedConfigMismatch,
     InvalidRelationalPassInterval,
     CheckpointSaveFailed,
+    CheckpointSaveMustRunOnRoot,
 };
 
 fn createConfiguredTokenizer(
@@ -2320,19 +2321,14 @@ pub const DistributedTrainerFuthark = struct {
         return graph_ptr;
     }
 
+    /// Persist the root rank's already-synchronized model state.
+    ///
+    /// Checkpoint serialization is intentionally root-only.  Callers must use
+    /// a CPU-side stage rendezvous around this operation; using an NCCL
+    /// collective here would require every rank to enter this method and can
+    /// otherwise mismatch the next training collective.
     pub fn saveCheckpoint(self: *DistributedTrainerFuthark, path: []const u8) !void {
-        try self.coordinator.synchronize();
-
-        if (!self.coordinator.isRoot()) {
-            const global_save_status = try self.allReduceMaximumU64(0);
-            if (global_save_status != 0) return TrainerError.CheckpointSaveFailed;
-            return;
-        }
-
-        var broadcast_error: u64 = 0;
-        errdefer {
-            _ = self.allReduceMaximumU64(1) catch {};
-        }
+        if (!self.coordinator.isRoot()) return TrainerError.CheckpointSaveMustRunOnRoot;
 
         try self.accelerator.sync();
 
@@ -2476,10 +2472,6 @@ pub const DistributedTrainerFuthark = struct {
         tokenizer_tmp_committed = true;
         deletePath(tokenizer_tmp);
         syncContainingDirectory(path);
-
-        broadcast_error = 0;
-        const global_save_status = try self.allReduceMaximumU64(broadcast_error);
-        if (global_save_status != 0) return TrainerError.CheckpointSaveFailed;
 
         std.debug.print("Checkpoint saved to {s} at step {d}\n", .{ path, self.global_step });
     }

@@ -332,6 +332,139 @@ fn loadTokenizerDataset(
     return samples.toOwnedSlice();
 }
 
+const StageMarkerState = enum {
+    pending,
+    ok,
+    fail,
+};
+
+const STAGE_SYNC_TIMEOUT_NS: i128 = 30 * 60 * std.time.ns_per_s;
+const STAGE_SYNC_POLL_NS: u64 = 50 * std.time.ns_per_ms;
+
+fn readStageMarker(path: []const u8) StageMarkerState {
+    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch return .pending;
+    defer file.close();
+
+    var status_buffer: [4]u8 = undefined;
+    const bytes_read = file.readAll(&status_buffer) catch return .pending;
+    if (std.mem.eql(u8, status_buffer[0..bytes_read], "ok")) return .ok;
+    if (std.mem.eql(u8, status_buffer[0..bytes_read], "fail")) return .fail;
+    return .pending;
+}
+
+fn writeStageMarker(path: []const u8, state: StageMarkerState) !void {
+    const marker = switch (state) {
+        .ok => "ok",
+        .fail => "fail",
+        .pending => return error.InvalidStageMarker,
+    };
+
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(marker);
+    try file.sync();
+}
+
+fn waitForStageMarker(path: []const u8, deadline_ns: i128) !StageMarkerState {
+    while (true) {
+        const state = readStageMarker(path);
+        if (state != .pending) return state;
+        if (std.time.nanoTimestamp() >= deadline_ns) return error.StageSynchronizationTimeout;
+        std.time.sleep(STAGE_SYNC_POLL_NS);
+    }
+}
+
+fn waitForAllRankMarkers(
+    allocator: std.mem.Allocator,
+    status_base_path: []const u8,
+    stage_name: []const u8,
+    world_size: usize,
+    suffix: []const u8,
+    deadline_ns: i128,
+) !bool {
+    while (true) {
+        var every_rank_reported = true;
+        var every_rank_succeeded = true;
+        var inspected_rank: usize = 0;
+
+        while (inspected_rank < world_size) : (inspected_rank += 1) {
+            const marker_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}.{s}.rank_{d}.{s}",
+                .{ status_base_path, stage_name, inspected_rank, suffix },
+            );
+            const marker_state = readStageMarker(marker_path);
+            allocator.free(marker_path);
+
+            switch (marker_state) {
+                .pending => {
+                    every_rank_reported = false;
+                    break;
+                },
+                .ok => {},
+                .fail => every_rank_succeeded = false,
+            }
+        }
+
+        if (every_rank_reported) return every_rank_succeeded;
+        if (std.time.nanoTimestamp() >= deadline_ns) return error.StageSynchronizationTimeout;
+        std.time.sleep(STAGE_SYNC_POLL_NS);
+    }
+}
+
+fn removeStageMarkers(
+    allocator: std.mem.Allocator,
+    status_base_path: []const u8,
+    stage_name: []const u8,
+    world_size: usize,
+) void {
+    const ready_path = std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.ready",
+        .{ status_base_path, stage_name },
+    ) catch return;
+    defer allocator.free(ready_path);
+    std.fs.deleteFileAbsolute(ready_path) catch {};
+
+    const global_path = std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.global.status",
+        .{ status_base_path, stage_name },
+    ) catch return;
+    defer allocator.free(global_path);
+    std.fs.deleteFileAbsolute(global_path) catch {};
+
+    var cleanup_rank: usize = 0;
+    while (cleanup_rank < world_size) : (cleanup_rank += 1) {
+        const status_path = std.fmt.allocPrint(
+            allocator,
+            "{s}.{s}.rank_{d}.status",
+            .{ status_base_path, stage_name, cleanup_rank },
+        ) catch continue;
+        defer allocator.free(status_path);
+        std.fs.deleteFileAbsolute(status_path) catch {};
+
+        const ack_path = std.fmt.allocPrint(
+            allocator,
+            "{s}.{s}.rank_{d}.ack",
+            .{ status_base_path, stage_name, cleanup_rank },
+        ) catch continue;
+        defer allocator.free(ack_path);
+        std.fs.deleteFileAbsolute(ack_path) catch {};
+    }
+}
+
+/// Synchronize a CPU-side stage across ranks without using NCCL collectives.
+///
+/// The earlier implementation used an NCCL all-reduce as a process barrier.
+/// NCCL guarantees ordering for GPU work but is not a safe control-plane
+/// rendezvous for rank-local filesystem work: a rank could observe an empty
+/// global-status file before slower ranks had completed their I/O.  This is
+/// especially likely when ranks contend for a multi-gigabyte dataset volume.
+/// The durable marker protocol below makes the dependency explicit:
+/// root publishes readiness, every rank durably reports its local result, root
+/// publishes the aggregate result, and every rank acknowledges that result
+/// before root removes the markers.
 fn synchronizeStageStatus(
     allocator: std.mem.Allocator,
     coordinator: *GPUCoordinator,
@@ -339,176 +472,78 @@ fn synchronizeStageStatus(
     stage_name: []const u8,
     local_error: ?anyerror,
 ) !void {
+    const ready_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.ready",
+        .{ status_base_path, stage_name },
+    );
+    defer allocator.free(ready_path);
+
     const rank_status_path = try std.fmt.allocPrint(
         allocator,
         "{s}.{s}.rank_{d}.status",
-        .{
-            status_base_path,
-            stage_name,
-            coordinator.rank,
-        },
+        .{ status_base_path, stage_name, coordinator.rank },
     );
     defer allocator.free(rank_status_path);
 
     const global_status_path = try std.fmt.allocPrint(
         allocator,
         "{s}.{s}.global.status",
-        .{
-            status_base_path,
-            stage_name,
-        },
+        .{ status_base_path, stage_name },
     );
     defer allocator.free(global_status_path);
 
-    if (coordinator.isRoot()) {
-        std.fs.deleteFileAbsolute(global_status_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => {},
-        };
+    const rank_ack_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}.rank_{d}.ack",
+        .{ status_base_path, stage_name, coordinator.rank },
+    );
+    defer allocator.free(rank_ack_path);
 
-        var cleanup_rank: usize = 0;
-        while (cleanup_rank < coordinator.world_size) : (cleanup_rank += 1) {
-            const cleanup_path = try std.fmt.allocPrint(
-                allocator,
-                "{s}.{s}.rank_{d}.status",
-                .{
-                    status_base_path,
-                    stage_name,
-                    cleanup_rank,
-                },
-            );
-            defer allocator.free(cleanup_path);
-
-            std.fs.deleteFileAbsolute(cleanup_path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => {},
-            };
-        }
-    }
-
-    try coordinator.synchronize();
-
-    var effective_local_error = local_error;
-
-    {
-        const status_file = std.fs.createFileAbsolute(
-            rank_status_path,
-            .{ .truncate = true },
-        ) catch |err| status_file_failure: {
-            effective_local_error = effective_local_error orelse err;
-            break :status_file_failure null;
-        };
-
-        if (status_file) |file| {
-            defer file.close();
-
-            const status_text = if (effective_local_error == null) "ok" else "fail";
-            file.writeAll(status_text) catch |err| {
-                effective_local_error = effective_local_error orelse err;
-            };
-            file.sync() catch |err| {
-                effective_local_error = effective_local_error orelse err;
-            };
-        }
-    }
-
-    try coordinator.synchronize();
+    const deadline_ns = std.time.nanoTimestamp() + STAGE_SYNC_TIMEOUT_NS;
 
     if (coordinator.isRoot()) {
-        var all_succeeded = true;
-        var inspected_rank: usize = 0;
-
-        while (inspected_rank < coordinator.world_size) : (inspected_rank += 1) {
-            const inspected_path = try std.fmt.allocPrint(
-                allocator,
-                "{s}.{s}.rank_{d}.status",
-                .{
-                    status_base_path,
-                    stage_name,
-                    inspected_rank,
-                },
-            );
-            defer allocator.free(inspected_path);
-
-            const status_file = std.fs.openFileAbsolute(
-                inspected_path,
-                .{ .mode = .read_only },
-            ) catch {
-                all_succeeded = false;
-                continue;
-            };
-            defer status_file.close();
-
-            var status_buffer: [4]u8 = undefined;
-            const bytes_read = status_file.readAll(&status_buffer) catch {
-                all_succeeded = false;
-                continue;
-            };
-
-            if (!std.mem.eql(u8, status_buffer[0..bytes_read], "ok")) {
-                all_succeeded = false;
-            }
-        }
-
-        const global_file = std.fs.createFileAbsolute(
-            global_status_path,
-            .{ .truncate = true },
-        ) catch null;
-
-        if (global_file) |file| {
-            defer file.close();
-            file.writeAll(if (all_succeeded) "ok" else "fail") catch {};
-            file.sync() catch {};
-        }
+        removeStageMarkers(allocator, status_base_path, stage_name, coordinator.world_size);
+        try writeStageMarker(ready_path, .ok);
+    } else {
+        _ = try waitForStageMarker(ready_path, deadline_ns);
     }
 
-    try coordinator.synchronize();
+    const local_state: StageMarkerState = if (local_error == null) .ok else .fail;
+    try writeStageMarker(rank_status_path, local_state);
 
-    var global_succeeded = false;
-
-    {
-        const global_file = std.fs.openFileAbsolute(
-            global_status_path,
-            .{ .mode = .read_only },
-        ) catch null;
-
-        if (global_file) |file| {
-            defer file.close();
-
-            var status_buffer: [4]u8 = undefined;
-            const bytes_read = file.readAll(&status_buffer) catch 0;
-            global_succeeded = std.mem.eql(
-                u8,
-                status_buffer[0..bytes_read],
-                "ok",
-            );
-        }
+    var global_state: StageMarkerState = undefined;
+    if (coordinator.isRoot()) {
+        const all_succeeded = try waitForAllRankMarkers(
+            allocator,
+            status_base_path,
+            stage_name,
+            coordinator.world_size,
+            "status",
+            deadline_ns,
+        );
+        global_state = if (all_succeeded) .ok else .fail;
+        try writeStageMarker(global_status_path, global_state);
+    } else {
+        global_state = try waitForStageMarker(global_status_path, deadline_ns);
     }
 
-    try coordinator.synchronize();
+    try writeStageMarker(rank_ack_path, .ok);
 
     if (coordinator.isRoot()) {
-        std.fs.deleteFileAbsolute(global_status_path) catch {};
-
-        var cleanup_rank: usize = 0;
-        while (cleanup_rank < coordinator.world_size) : (cleanup_rank += 1) {
-            const cleanup_path = std.fmt.allocPrint(
-                allocator,
-                "{s}.{s}.rank_{d}.status",
-                .{
-                    status_base_path,
-                    stage_name,
-                    cleanup_rank,
-                },
-            ) catch continue;
-            defer allocator.free(cleanup_path);
-
-            std.fs.deleteFileAbsolute(cleanup_path) catch {};
-        }
+        _ = try waitForAllRankMarkers(
+            allocator,
+            status_base_path,
+            stage_name,
+            coordinator.world_size,
+            "ack",
+            deadline_ns,
+        );
+        removeStageMarkers(allocator, status_base_path, stage_name, coordinator.world_size);
     }
 
-    if (!global_succeeded) {
-        return effective_local_error orelse error.DistributedStageFailed;
+    if (global_state != .ok) {
+        return local_error orelse error.DistributedStageFailed;
     }
 }
 
@@ -1430,6 +1465,8 @@ pub fn main() !void {
         const elapsed_seconds =
             @as(f64, @floatFromInt(elapsed_nanoseconds)) / 1.0e9;
 
+        var epoch_artifact_error: ?anyerror = null;
+
         if (coordinator.isRoot()) {
             loss_history.append(.{
                 .epoch = epoch + 1,
@@ -1441,6 +1478,7 @@ pub fn main() !void {
                     .{err},
                 );
                 metrics_failures += 1;
+                epoch_artifact_error = err;
             };
 
             std.debug.print(
@@ -1462,6 +1500,7 @@ pub fn main() !void {
                             .{err},
                         );
                         checkpoint_failures += 1;
+                        epoch_artifact_error = epoch_artifact_error orelse err;
                         break :checkpoint_creation;
                     },
                 };
@@ -1477,6 +1516,7 @@ pub fn main() !void {
                         .{err},
                     );
                     checkpoint_failures += 1;
+                    epoch_artifact_error = epoch_artifact_error orelse err;
                     break :checkpoint_creation;
                 };
 
@@ -1485,12 +1525,10 @@ pub fn main() !void {
                     else => {
                         std.debug.print(
                             "[Rank 0] Failed to create {s}: {}\n",
-                            .{
-                                directory_path,
-                                err,
-                            },
+                            .{ directory_path, err },
                         );
                         checkpoint_failures += 1;
+                        epoch_artifact_error = epoch_artifact_error orelse err;
                         break :checkpoint_creation;
                     },
                 };
@@ -1506,6 +1544,7 @@ pub fn main() !void {
                         .{err},
                     );
                     checkpoint_failures += 1;
+                    epoch_artifact_error = epoch_artifact_error orelse err;
                     break :checkpoint_creation;
                 };
 
@@ -1518,34 +1557,47 @@ pub fn main() !void {
                         std.debug.dumpStackTrace(trace.*);
                     }
                     checkpoint_failures += 1;
+                    epoch_artifact_error = epoch_artifact_error orelse err;
                     break :checkpoint_creation;
                 };
 
-                std.debug.print(
-                    "Checkpoint saved: {s}\n",
-                    .{checkpoint_path},
-                );
+                std.debug.print("Checkpoint saved: {s}\n", .{checkpoint_path});
             }
 
-            writeTrainingMetrics(
-                allocator,
-                loss_history.items,
-                model_dim,
-                num_layers,
-                local_batch_size,
-                learning_rate,
-                samples.len,
-                num_epochs,
-            ) catch |err| {
-                std.debug.print(
-                    "[Rank 0] Failed to write training metrics: {}\n",
-                    .{err},
-                );
-                metrics_failures += 1;
-            };
+            if (epoch_artifact_error == null) {
+                writeTrainingMetrics(
+                    allocator,
+                    loss_history.items,
+                    model_dim,
+                    num_layers,
+                    local_batch_size,
+                    learning_rate,
+                    samples.len,
+                    num_epochs,
+                ) catch |err| {
+                    std.debug.print(
+                        "[Rank 0] Failed to write training metrics: {}\n",
+                        .{err},
+                    );
+                    metrics_failures += 1;
+                    epoch_artifact_error = err;
+                };
+            }
         }
 
-        try coordinator.synchronize();
+        synchronizeStageStatus(
+            allocator,
+            &coordinator,
+            nccl_id_path,
+            "epoch_artifacts",
+            epoch_artifact_error,
+        ) catch |err| {
+            std.debug.print(
+                "[Rank {d}] checkpoint/metrics stage failed after epoch {d}: {}\n",
+                .{ rank, epoch + 1, err },
+            );
+            return err;
+        };
     }
 
     if (coordinator.isRoot()) {
