@@ -50,16 +50,21 @@ fn appendDatasetRange(
     const file = try std.fs.openFileAbsolute(dataset_path, .{ .mode = .read_only });
     defer file.close();
 
-    var arena = core_memory.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     var buffered_reader = std.io.bufferedReader(file.reader());
     var stream = buffered_reader.reader();
     var valid_index: usize = 0;
     var appended: usize = 0;
 
-    while (try stream.readUntilDelimiterOrEofAlloc(arena.allocator(), '\n', max_line_size)) |line| {
-        defer arena.secureReset();
+    while (true) {
+        var arena = core_memory.ArenaAllocator.init(allocator, 64 * 1024);
+        defer arena.deinit();
+
+        const maybe_line = try stream.readUntilDelimiterOrEofAlloc(
+            arena.allocator(),
+            '\n',
+            max_line_size,
+        );
+        const line = maybe_line orelse break;
 
         if (valid_index >= end_valid_index) break;
 
@@ -134,18 +139,19 @@ fn loadDataset(
         );
         defer count_file.close();
 
-        var arena = core_memory.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
         var buffered_reader = std.io.bufferedReader(count_file.reader());
         var stream = buffered_reader.reader();
 
-        while (try stream.readUntilDelimiterOrEofAlloc(
-            arena.allocator(),
-            '\n',
-            max_line_size,
-        )) |line| {
-            defer arena.secureReset();
+        while (true) {
+            var arena = core_memory.ArenaAllocator.init(allocator, 64 * 1024);
+            defer arena.deinit();
+
+            const maybe_line = try stream.readUntilDelimiterOrEofAlloc(
+                arena.allocator(),
+                '\n',
+                max_line_size,
+            );
+            const line = maybe_line orelse break;
 
             const maybe_text = extractDatasetText(&arena, line) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -283,9 +289,6 @@ fn loadTokenizerDataset(
     );
     defer file.close();
 
-    var arena = core_memory.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     var buffered_reader = std.io.bufferedReader(file.reader());
     var stream = buffered_reader.reader();
     var samples = std.ArrayList([]const u8).init(allocator);
@@ -297,12 +300,16 @@ fn loadTokenizerDataset(
         samples.deinit();
     }
 
-    while (try stream.readUntilDelimiterOrEofAlloc(
-        arena.allocator(),
-        '\n',
-        max_line_size,
-    )) |line| {
-        defer arena.secureReset();
+    while (true) {
+        var arena = core_memory.ArenaAllocator.init(allocator, 64 * 1024);
+        defer arena.deinit();
+
+        const maybe_line = try stream.readUntilDelimiterOrEofAlloc(
+            arena.allocator(),
+            '\n',
+            max_line_size,
+        );
+        const line = maybe_line orelse break;
 
         const maybe_text = try extractDatasetText(&arena, line);
         if (maybe_text) |text| {
@@ -1292,7 +1299,10 @@ pub fn main() !void {
             if (text.len == 0) continue;
             const h = fnv1aHashBytes(std.mem.sliceAsBytes(text));
             sample_hashes.append(h) catch |err| {
-                std.debug.print("[Rank {d}] graph-construction: sample_hashes.append (i={d}) failed: {}\n", .{ rank, sample_hashes.items.len, err });
+                std.debug.print(
+                    "[Rank {d}] graph-construction: sample_hashes.append (i={d}) failed: {}\n",
+                    .{ rank, sample_hashes.items.len, err },
+                );
                 graph_stage_error = err;
                 break :graph_construction;
             };
@@ -1307,7 +1317,10 @@ pub fn main() !void {
                 0,
                 allocator,
             ) catch |err| {
-                std.debug.print("[Rank {d}] graph-construction: batchEncodeGraph failed: {} (n={d} hashes)\n", .{ rank, err, sample_hashes.items.len });
+                std.debug.print(
+                    "[Rank {d}] graph-construction: batchEncodeGraph failed: {} (n={d} hashes)\n",
+                    .{ rank, err, sample_hashes.items.len },
+                );
                 graph_stage_error = err;
                 break :graph_construction;
             };
@@ -1322,7 +1335,10 @@ pub fn main() !void {
                 gpu_result.edge_srcs,
                 gpu_result.edge_tgts,
             ) catch |err| {
-                std.debug.print("[Rank {d}] graph-construction: bulkImportFromGPU failed: {} (nodes={d} edges={d})\n", .{ rank, err, gpu_result.hashes.len, gpu_result.edge_srcs.len });
+                std.debug.print(
+                    "[Rank {d}] graph-construction: bulkImportFromGPU failed: {} (nodes={d} edges={d})\n",
+                    .{ rank, err, gpu_result.hashes.len, gpu_result.edge_srcs.len },
+                );
                 graph_stage_error = err;
                 break :graph_construction;
             };
@@ -1336,7 +1352,10 @@ pub fn main() !void {
         }
 
         trainer.signal_engine.propagateStep() catch |err| {
-            std.debug.print("[Rank {d}] graph-construction: signal propagateStep failed: {}\n", .{ rank, err });
+            std.debug.print(
+                "[Rank {d}] graph-construction: signal propagateStep failed: {}\n",
+                .{ rank, err },
+            );
             graph_stage_error = err;
             break :graph_construction;
         };
@@ -1344,7 +1363,10 @@ pub fn main() !void {
         trainer.r_gpu.distributeGraph(
             trainer.nsir_graph,
         ) catch |err| {
-            std.debug.print("[Rank {d}] graph-construction: distributeGraph failed: {}\n", .{ rank, err });
+            std.debug.print(
+                "[Rank {d}] graph-construction: distributeGraph failed: {}\n",
+                .{ rank, err },
+            );
             graph_stage_error = err;
             break :graph_construction;
         };
@@ -1633,9 +1655,3 @@ fn writeTrainingMetrics(
 
     try std.fs.renameAbsolute(temporary_path, final_path);
 }
-
-
-
-
-
-End of Codebase
