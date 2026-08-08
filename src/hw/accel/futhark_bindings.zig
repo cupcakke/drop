@@ -10,50 +10,34 @@ pub const struct_futhark_f16_1d = opaque {};
 pub const struct_futhark_f16_2d = opaque {};
 pub const struct_futhark_f16_3d = opaque {};
 
-pub const gpu_stub = if (_build_gpu_enabled) struct {
-    pub extern "c" fn futhark_context_config_set_device(cfg: ?*struct_futhark_context_config, device: [*:0]const u8) void;
-    pub extern "c" fn futhark_context_config_set_default_group_size(cfg: ?*struct_futhark_context_config, size: c_int) void;
-    pub extern "c" fn futhark_context_config_set_default_num_groups(cfg: ?*struct_futhark_context_config, num: c_int) void;
-    pub extern "c" fn futhark_context_config_set_default_tile_size(cfg: ?*struct_futhark_context_config, size: c_int) void;
-    pub extern "c" fn futhark_context_config_set_cache_file(cfg: ?*struct_futhark_context_config, f: [*:0]const u8) void;
+/// GPU-only context controls emitted by `futhark cuda --library`.
+/// They are never referenced by CPU builds; a disabled build reports an
+/// explicit error instead of silently accepting GPU settings as no-ops.
+pub const GpuConfigurationError = error{GpuAccelerationDisabled};
 
-    pub inline fn set_device(cfg: ?*struct_futhark_context_config, device: [*:0]const u8) void {
-        futhark_context_config_set_device(cfg, device);
+pub extern "c" fn futhark_context_config_set_device(cfg: ?*struct_futhark_context_config, device: [*:0]const u8) void;
+pub extern "c" fn futhark_context_config_set_default_group_size(cfg: ?*struct_futhark_context_config, size: c_int) void;
+pub extern "c" fn futhark_context_config_set_default_num_groups(cfg: ?*struct_futhark_context_config, num: c_int) void;
+pub extern "c" fn futhark_context_config_set_default_tile_size(cfg: ?*struct_futhark_context_config, size: c_int) void;
+pub extern "c" fn futhark_context_config_set_cache_file(cfg: ?*struct_futhark_context_config, path: [*:0]const u8) void;
+
+pub fn configureGpuContext(
+    cfg: ?*struct_futhark_context_config,
+    cache_file: ?[*:0]const u8,
+) GpuConfigurationError!void {
+    if (comptime _build_gpu_enabled) {
+        futhark_context_config_set_device(cfg, "");
+        futhark_context_config_set_default_group_size(cfg, 256);
+        futhark_context_config_set_default_num_groups(cfg, 128);
+        futhark_context_config_set_default_tile_size(cfg, 32);
+        if (cache_file) |path| futhark_context_config_set_cache_file(cfg, path);
+        return;
     }
-    pub inline fn set_default_group_size(cfg: ?*struct_futhark_context_config, size: c_int) void {
-        futhark_context_config_set_default_group_size(cfg, size);
-    }
-    pub inline fn set_default_num_groups(cfg: ?*struct_futhark_context_config, num: c_int) void {
-        futhark_context_config_set_default_num_groups(cfg, num);
-    }
-    pub inline fn set_default_tile_size(cfg: ?*struct_futhark_context_config, size: c_int) void {
-        futhark_context_config_set_default_tile_size(cfg, size);
-    }
-    pub inline fn set_cache_file(cfg: ?*struct_futhark_context_config, path: [*:0]const u8) void {
-        futhark_context_config_set_cache_file(cfg, path);
-    }
-} else struct {
-    pub inline fn set_device(cfg: ?*struct_futhark_context_config, device: [*:0]const u8) void {
-        _ = cfg;
-        _ = device;
-    }
-    pub inline fn set_default_group_size(cfg: ?*struct_futhark_context_config, size: c_int) void {
-        _ = cfg;
-        _ = size;
-    }
-    pub inline fn set_default_num_groups(cfg: ?*struct_futhark_context_config, num: c_int) void {
-        _ = cfg;
-        _ = num;
-    }
-    pub inline fn set_default_tile_size(cfg: ?*struct_futhark_context_config, size: c_int) void {
-        _ = cfg;
-        _ = size;
-    }
-    pub inline fn set_cache_file(cfg: ?*struct_futhark_context_config, path: [*:0]const u8) void {
-        _ = cfg;
-        _ = path;
-    }
-};
+    _ = cfg;
+    _ = cache_file;
+    return error.GpuAccelerationDisabled;
+}
+
 pub const struct_futhark_f32_1d = opaque {};
 pub const struct_futhark_f32_2d = opaque {};
 pub const struct_futhark_f32_3d = opaque {};

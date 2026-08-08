@@ -16,6 +16,42 @@ pub const IoConfig = struct {
     pub const MAX_PATH_LEN: usize = 4096;
 };
 
+/// Opens a path independently of whether the caller supplied an absolute or
+/// working-directory-relative path.  Zig's `cwd()` directory handles only
+/// relative paths, so serialization APIs must dispatch explicitly.
+pub fn openFilePath(path: []const u8, flags: fs.File.OpenFlags) !fs.File {
+    if (path.len == 0) return error.InvalidPath;
+    if (fs.path.isAbsolute(path)) return fs.openFileAbsolute(path, flags);
+    return fs.cwd().openFile(path, flags);
+}
+
+/// Creates or truncates a path independently of whether it is absolute or
+/// working-directory-relative.  Parent directories are deliberately not
+/// created here: callers retain control over persistence layout and errors.
+pub fn createFilePath(path: []const u8, flags: fs.File.CreateFlags) !fs.File {
+    if (path.len == 0) return error.InvalidPath;
+    if (fs.path.isAbsolute(path)) return fs.createFileAbsolute(path, flags);
+    return fs.cwd().createFile(path, flags);
+}
+
+pub fn deleteFilePath(path: []const u8) !void {
+    if (path.len == 0) return error.InvalidPath;
+    if (fs.path.isAbsolute(path)) return fs.deleteFileAbsolute(path);
+    return fs.cwd().deleteFile(path);
+}
+
+/// Renaming requires both paths to be rooted in the same directory namespace.
+/// This helper supports absolute-to-absolute and relative-to-relative moves;
+/// mixed forms are rejected instead of silently resolving the wrong target.
+pub fn renameFilePath(old_path: []const u8, new_path: []const u8) !void {
+    if (old_path.len == 0 or new_path.len == 0) return error.InvalidPath;
+    const old_is_absolute = fs.path.isAbsolute(old_path);
+    const new_is_absolute = fs.path.isAbsolute(new_path);
+    if (old_is_absolute != new_is_absolute) return error.InvalidPath;
+    if (old_is_absolute) return fs.renameAbsolute(old_path, new_path);
+    return fs.cwd().rename(old_path, new_path);
+}
+
 pub const IoError = error{
     InvalidFileSize,
     FileTooLarge,
@@ -83,7 +119,7 @@ pub const MMAP = struct {
     last_read: ?[]u8,
 
     pub fn open(allocator: Allocator, path: []const u8, mode: fs.File.OpenFlags) !MMAP {
-        const file = try fs.cwd().openFile(path, mode);
+        const file = try openFilePath(path, mode);
         errdefer file.close();
         return openFromFile(allocator, file, mode);
     }
@@ -276,7 +312,7 @@ pub const DurableWriter = struct {
     mutex: std.Thread.Mutex,
 
     pub fn init(path: []const u8, enable_sync: bool) !DurableWriter {
-        const file = try fs.cwd().createFile(path, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
+        const file = try createFilePath(path, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
         return .{
             .file = file,
             .buffer = mem.zeroes([IoConfig.BUFFER_SIZE]u8),
@@ -388,7 +424,7 @@ pub const BufferedReader = struct {
     }
 
     pub fn initWithMaxBytes(path: []const u8, max_bytes: usize) !BufferedReader {
-        const file = try fs.cwd().openFile(path, .{});
+        const file = try openFilePath(path, .{});
         return .{
             .file = file,
             .buffer = mem.zeroes([IoConfig.BUFFER_SIZE]u8),
@@ -510,7 +546,7 @@ pub const BufferedWriter = struct {
 
     pub fn init(allocator: Allocator, path: []const u8, buffer_size: usize) !BufferedWriter {
         if (buffer_size == 0) return IoError.InvalidBufferSize;
-        const file = try fs.cwd().createFile(path, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
+        const file = try createFilePath(path, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
         errdefer file.close();
         const buffer = try allocator.alloc(u8, buffer_size);
         errdefer allocator.free(buffer);
@@ -638,7 +674,7 @@ pub fn readFileWithDir(allocator: Allocator, dir: fs.Dir, path: []const u8) ![]u
 }
 
 pub fn readFileLimited(allocator: Allocator, path: []const u8, max_size: usize) ![]u8 {
-    const file = try fs.cwd().openFile(path, .{});
+    const file = try openFilePath(path, .{});
     defer file.close();
     return file.readToEndAlloc(allocator, max_size);
 }
@@ -664,7 +700,7 @@ pub fn writeFileWithOptions(path: []const u8, data: []const u8, options: WriteFi
             try fs.cwd().copyFile(path, fs.cwd(), backup_path, .{});
         }
     }
-    const file = try fs.cwd().createFile(path, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
+    const file = try createFilePath(path, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
     defer file.close();
     try file.writeAll(data);
     if (options.sync_after_write) try file.sync();
@@ -700,10 +736,10 @@ pub fn copyFileWithProgress(
     dst: []const u8,
     progress_callback: ?*const fn(CopyProgress) void
 ) !void {
-    const src_file = try fs.cwd().openFile(src, .{});
+    const src_file = try openFilePath(src, .{});
     defer src_file.close();
 
-    const dst_file = try fs.cwd().createFile(dst, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
+    const dst_file = try createFilePath(dst, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
     var dst_closed = false;
     errdefer {
         if (!dst_closed) {
@@ -850,7 +886,7 @@ pub fn sequentialWrite(allocator: Allocator, path: []const u8, data: []const []c
 }
 
 pub fn sequentialRead(allocator: Allocator, path: []const u8, chunk_callback: *const fn([]const u8) anyerror!void) !void {
-    const file = try fs.cwd().openFile(path, .{});
+    const file = try openFilePath(path, .{});
     defer file.close();
 
     const buffer = try allocator.alloc(u8, IoConfig.LARGE_CHUNK_SIZE);
@@ -867,7 +903,7 @@ pub fn atomicWrite(path: []const u8, data: []const u8) !void {
     var temp_buf: [IoConfig.MAX_PATH_LEN + 32]u8 = undefined;
     const temp_path = std.fmt.bufPrint(&temp_buf, "{s}.tmp.{x}", .{path, std.crypto.random.int(u64)}) catch return IoError.PathTooLong;
 
-    const file = try fs.cwd().createFile(temp_path, .{ .mode = IoConfig.SECURE_FILE_MODE });
+    const file = try createFilePath(temp_path, .{ .mode = IoConfig.SECURE_FILE_MODE });
     var file_closed = false;
     errdefer {
         if (!file_closed) file.close();
@@ -883,10 +919,10 @@ pub fn atomicWrite(path: []const u8, data: []const u8) !void {
 }
 
 pub fn compareFiles(allocator: Allocator, path1: []const u8, path2: []const u8) !bool {
-    const file1 = try fs.cwd().openFile(path1, .{});
+    const file1 = try openFilePath(path1, .{});
     defer file1.close();
 
-    const file2 = try fs.cwd().openFile(path2, .{});
+    const file2 = try openFilePath(path2, .{});
     defer file2.close();
 
     const stat1 = try file1.stat();
@@ -919,6 +955,26 @@ pub fn compareFiles(allocator: Allocator, path1: []const u8, path2: []const u8) 
     return true;
 }
 
+test "path file helpers support absolute paths" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var path_buffer: [IoConfig.MAX_PATH_LEN]u8 = undefined;
+    const directory_path = try tmp_dir.dir.realpath(".", &path_buffer);
+    const absolute_path = try std.fmt.allocPrint(allocator, "{s}/absolute-path.bin", .{directory_path});
+    defer allocator.free(absolute_path);
+
+    const file = try createFilePath(absolute_path, .{ .truncate = true });
+    try file.writeAll("absolute path support");
+    file.close();
+
+    const read_file = try openFilePath(absolute_path, .{ .mode = .read_only });
+    defer read_file.close();
+    var buffer: [21]u8 = undefined;
+    try read_file.reader().readNoEof(&buffer);
+    try std.testing.expectEqualStrings("absolute path support", &buffer);
+}
 test "MMAP open and close" {
     const gpa = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
@@ -1020,7 +1076,7 @@ test "Atomic write" {
     defer gpa.free(test_path);
 
     try atomicWrite(test_path, "data");
-    defer fs.cwd().deleteFile(test_path) catch {};
+    defer deleteFilePath(test_path) catch {};
     const content = try readFile(gpa, test_path);
     defer gpa.free(content);
     try std.testing.expectEqualStrings("data", content);

@@ -6,7 +6,8 @@ const types = @import("../core/types.zig");
 const BitSet = types.BitSet;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const SSI = @import("../index/ssi.zig").SSI;
-const stableHash = @import("../core/io.zig").stableHash;
+const core_io = @import("../core/io.zig");
+const stableHash = core_io.stableHash;
 const Error = types.Error;
 
 pub const RankerConfig = struct {
@@ -971,7 +972,7 @@ pub const Ranker = struct {
     }
 
     pub fn exportModel(self: *const Ranker, path: []const u8) !void {
-        var file = try std.fs.cwd().createFile(path, .{});
+        var file = try core_io.createFilePath(path, .{});
         defer file.close();
         var writer = file.writer();
         try writer.writeInt(u8, 2, .little);
@@ -991,7 +992,7 @@ pub const Ranker = struct {
     }
 
     pub fn importModel(self: *Ranker, path: []const u8) !void {
-        const file = try std.fs.cwd().openFile(path, .{});
+        const file = try core_io.openFilePath(path, .{});
         defer file.close();
         var reader = file.reader();
         const version = try reader.readInt(u8, .little);

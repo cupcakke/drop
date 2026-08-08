@@ -1,9 +1,3 @@
-const _build_gpu_enabled: bool = blk: {
-    const opts = @import("build_options");
-    if (@hasDecl(opts, "gpu_acceleration")) break :blk opts.gpu_acceleration;
-    break :blk false;
-};
-
 pub const cudaError_t = c_uint;
 pub const cudaSuccess: cudaError_t = 0;
 pub const cudaErrorInvalidValue: cudaError_t = 1;
@@ -66,107 +60,26 @@ const RealApi = struct {
     pub extern "c" fn cudaGetDevice(device: *c_int) cudaError_t;
 };
 
-const StubApi = struct {
-    pub fn cudaHostAlloc(ptr: *?*anyopaque, size: usize, flags: c_uint) cudaError_t {
-        _ = ptr;
-        _ = size;
-        _ = flags;
-        return cudaErrorInitializationError;
-    }
-    pub fn cudaFreeHost(ptr: ?*anyopaque) cudaError_t {
-        _ = ptr;
-        return cudaSuccess;
-    }
-    pub fn cudaMalloc(devPtr: *?*anyopaque, size: usize) cudaError_t {
-        _ = devPtr;
-        _ = size;
-        return cudaErrorInitializationError;
-    }
-    pub fn cudaFree(devPtr: ?*anyopaque) cudaError_t {
-        _ = devPtr;
-        return cudaSuccess;
-    }
-    pub fn cudaMemcpy(dst: ?*anyopaque, src: ?*const anyopaque, count: usize, kind: c_uint) cudaError_t {
-        _ = dst;
-        _ = src;
-        _ = count;
-        _ = kind;
-        return cudaErrorInitializationError;
-    }
-    pub fn cudaMemcpyAsync(dst: ?*anyopaque, src: ?*const anyopaque, count: usize, kind: c_uint, stream: cudaStream_t) cudaError_t {
-        _ = dst;
-        _ = src;
-        _ = count;
-        _ = kind;
-        _ = stream;
-        return cudaErrorInitializationError;
-    }
-    pub fn cudaMemset(devPtr: ?*anyopaque, value: c_int, count: usize) cudaError_t {
-        _ = devPtr;
-        _ = value;
-        _ = count;
-        return cudaErrorInitializationError;
-    }
-    pub fn cudaDeviceSynchronize() cudaError_t {
-        return cudaSuccess;
-    }
-    pub fn cudaStreamSynchronize(stream: cudaStream_t) cudaError_t {
-        _ = stream;
-        return cudaSuccess;
-    }
-    pub fn cudaGetLastError() cudaError_t {
-        return cudaSuccess;
-    }
-    pub fn cudaPeekAtLastError() cudaError_t {
-        return cudaSuccess;
-    }
-    pub fn cudaGetErrorString(err: cudaError_t) [*:0]const u8 {
-        _ = err;
-        return "cuda stub (gpu disabled)";
-    }
-    pub fn cudaGetErrorName(err: cudaError_t) [*:0]const u8 {
-        _ = err;
-        return "cudaStub";
-    }
-    pub fn cudaStreamCreate(pStream: *cudaStream_t) cudaError_t {
-        _ = pStream;
-        return cudaErrorInitializationError;
-    }
-    pub fn cudaStreamDestroy(stream: cudaStream_t) cudaError_t {
-        _ = stream;
-        return cudaSuccess;
-    }
-    pub fn cudaGetDeviceCount(count: *c_int) cudaError_t {
-        count.* = 0;
-        return cudaSuccess;
-    }
-    pub fn cudaSetDevice(device: c_int) cudaError_t {
-        _ = device;
-        return cudaErrorInitializationError;
-    }
-    pub fn cudaGetDevice(device: *c_int) cudaError_t {
-        device.* = -1;
-        return cudaErrorInitializationError;
-    }
-};
+/// CUDA symbols are declared unconditionally, but callers must keep use sites
+/// behind a compile-time `gpu_enabled` branch.  This avoids linking fabricated
+/// CPU-only CUDA implementations while retaining the real CUDA ABI for GPU
+/// builds.
 
-pub const api = if (_build_gpu_enabled) RealApi else StubApi;
-
-pub const cudaHostAlloc = api.cudaHostAlloc;
-pub const cudaFreeHost = api.cudaFreeHost;
-pub const cudaMalloc = api.cudaMalloc;
-pub const cudaFree = api.cudaFree;
-pub const cudaMemcpy = api.cudaMemcpy;
-pub const cudaMemcpyAsync = api.cudaMemcpyAsync;
-pub const cudaMemset = api.cudaMemset;
-pub const cudaDeviceSynchronize = api.cudaDeviceSynchronize;
-pub const cudaStreamSynchronize = api.cudaStreamSynchronize;
-pub const cudaGetLastError = api.cudaGetLastError;
-pub const cudaPeekAtLastError = api.cudaPeekAtLastError;
-pub const cudaGetErrorString = api.cudaGetErrorString;
-pub const cudaGetErrorName = api.cudaGetErrorName;
-pub const cudaStreamCreate = api.cudaStreamCreate;
-pub const cudaStreamDestroy = api.cudaStreamDestroy;
-pub const cudaGetDeviceCount = api.cudaGetDeviceCount;
-pub const cudaSetDevice = api.cudaSetDevice;
-pub const cudaGetDevice = api.cudaGetDevice;
+pub const cudaHostAlloc = RealApi.cudaHostAlloc;
+pub const cudaFreeHost = RealApi.cudaFreeHost;
+pub const cudaMalloc = RealApi.cudaMalloc;
+pub const cudaFree = RealApi.cudaFree;
+pub const cudaMemcpy = RealApi.cudaMemcpy;
+pub const cudaMemcpyAsync = RealApi.cudaMemcpyAsync;
+pub const cudaMemset = RealApi.cudaMemset;
+pub const cudaDeviceSynchronize = RealApi.cudaDeviceSynchronize;
+pub const cudaStreamSynchronize = RealApi.cudaStreamSynchronize;
+pub const cudaGetLastError = RealApi.cudaGetLastError;
+pub const cudaPeekAtLastError = RealApi.cudaPeekAtLastError;
+pub const cudaGetErrorString = RealApi.cudaGetErrorString;
+pub const cudaGetErrorName = RealApi.cudaGetErrorName;
+pub const cudaStreamCreate = RealApi.cudaStreamCreate;
+pub const cudaStreamDestroy = RealApi.cudaStreamDestroy;
+pub const cudaGetDeviceCount = RealApi.cudaGetDeviceCount;
+pub const cudaSetDevice = RealApi.cudaSetDevice;
+pub const cudaGetDevice = RealApi.cudaGetDevice;

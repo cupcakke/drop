@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const memory = @import("../core/memory.zig");
+const core_io = @import("../core/io.zig");
 const accel = @import("../hw/accel/accel_interface.zig");
 const OFTB = @import("oftb.zig").OFTB;
 const types = @import("../core/types.zig");
@@ -1517,7 +1518,7 @@ pub const RSF = struct {
     }
 
     pub fn loadWithConfig(allocator: Allocator, path: []const u8, policy: ?RSFConfig) !RSF {
-        const file = try std.fs.cwd().openFile(path, .{});
+        const file = try core_io.openFilePath(path, .{});
         defer file.close();
 
         var buffered = std.io.bufferedReader(file.reader());
